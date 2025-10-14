@@ -37,6 +37,7 @@ class Qwen3ModelArgs(BaseModelArgs):
     depth_init: bool = True
 
     use_flex_attn: bool = False
+    use_hybrid_attn: bool = False  # Enable VLLMHybridAttentionWrapper for efficient inference
     attn_mask_type: str = "causal"
     eos_id: int = 151645
 

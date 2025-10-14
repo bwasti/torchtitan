@@ -13,18 +13,29 @@ from typing import ClassVar
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
-from torch.nn.attention.flex_attention import (
-    _mask_mod_signature,
-    AuxOutput,
-    BlockMask,
-    create_block_mask,
-    flex_attention,
-)
+try:
+    from torch.nn.attention.flex_attention import (
+        _mask_mod_signature,
+        AuxOutput,
+        BlockMask,
+        create_block_mask,
+        flex_attention,
+    )
+except ImportError:
+    # Older PyTorch versions don't have AuxOutput
+    from torch.nn.attention.flex_attention import (
+        _mask_mod_signature,
+        BlockMask,
+        create_block_mask,
+        flex_attention,
+    )
+    AuxOutput = None
 
 
 __all__ = [
     "FlexAttentionWrapper",
     "ScaledDotProductAttentionWrapper",
+    "VLLMHybridAttentionWrapper",
     "get_causal_mask_mod",
     "get_document_mask_mod",
     "get_fixed_block_mask_mod",
@@ -57,7 +68,7 @@ class FlexAttentionWrapper(torch.nn.Module):
         *,
         block_mask: BlockMask,
         scale: float | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, AuxOutput]:
+    ):
         # 1. _compiled_flex_attn has to be a class variable, otherwise there will
         #    be multiple compiled flex_attention instances, which can be slow.
         # 2. `self._compiled_flex_attn` is not correct, `self` will be passed in
@@ -89,6 +100,7 @@ class ScaledDotProductAttentionWrapper(torch.nn.Module):
             self.sdpa_backends = [
                 SDPBackend.CUDNN_ATTENTION,
                 SDPBackend.FLASH_ATTENTION,
+                SDPBackend.MATH,  # Always include MATH as fallback
                 SDPBackend.EFFICIENT_ATTENTION,
             ]
 
@@ -100,6 +112,146 @@ class ScaledDotProductAttentionWrapper(torch.nn.Module):
         *,
         scale: float | None = None,
     ) -> torch.Tensor:
+        with sdpa_kernel(self.sdpa_backends, set_priority=True):
+            return F.scaled_dot_product_attention(q, k, v, scale=scale, is_causal=True)
+
+
+class VLLMHybridAttentionWrapper(torch.nn.Module):
+    """Hybrid attention wrapper using Flash Attention 3 for vLLM compatibility.
+
+    This wrapper provides two attention paths:
+    1. Default: Uses PyTorch SDPA (same as ScaledDotProductAttentionWrapper)
+    2. use_vllm=True: Uses Flash Attention 3 directly (same backend as vLLM)
+
+    Usage:
+        # Regular torchtitan training (default behavior)
+        attn = VLLMHybridAttentionWrapper(...)
+        output = attn(q, k, v)  # Uses PyTorch SDPA
+
+        # vLLM-compatible mode (Flash Attention 3)
+        output = attn(q, k, v, use_vllm=True)  # Uses Flash Attention 3
+
+    Args:
+        num_heads: Number of query heads
+        head_size: Dimension of each attention head
+        scale: Attention scale factor (typically 1/sqrt(head_dim))
+        num_kv_heads: Number of key/value heads (for GQA/MQA)
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+
+        # SDPA path (default)
+        self.sdpa_backends = [
+            SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.MATH,
+            SDPBackend.EFFICIENT_ATTENTION,
+        ]
+
+        # Flash Attention path (vLLM-compatible)
+        self.use_flash_attn = False
+        try:
+            from flash_attn import flash_attn_varlen_func
+            self.flash_attn_varlen_func = flash_attn_varlen_func
+            self.use_flash_attn = True
+        except ImportError:
+            pass
+
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        scale: float | None = None,
+        use_vllm: bool = False,
+    ) -> torch.Tensor:
+        """Forward pass with optional Flash Attention 3.
+
+        Args:
+            q: Query tensor [batch, num_heads, seq_len, head_dim] or [batch, seq_len, num_heads, head_dim]
+            k: Key tensor [batch, num_kv_heads, seq_len, head_dim] or [batch, seq_len, num_kv_heads, head_dim]
+            v: Value tensor [batch, num_kv_heads, seq_len, head_dim] or [batch, seq_len, num_kv_heads, head_dim]
+            scale: Optional scale override
+            use_vllm: If True, use Flash Attention 3 (vLLM backend)
+
+        Returns:
+            Attention output in the same format as input
+        """
+        scale = scale if scale is not None else self.scale
+
+        # vLLM path: Use Flash Attention varlen (compatible with vLLM's wrapper)
+        if use_vllm and self.use_flash_attn:
+
+            # Flash Attention varlen expects: (batch, seqlen, nheads, headdim)
+            # Detect input format and transpose if needed
+            # The input from TorchTitan is always (batch, num_heads, seq_len, head_dim)
+            # We need to transpose to (batch, seq_len, num_heads, head_dim)
+            if q.dim() == 4:
+                # Check if shape[3] looks like head_dim (typically 64-128)
+                # vs shape[1] which could be num_heads (typically 8-32)
+                if q.shape[3] == self.head_size:
+                    # Input is (batch, num_heads, seq_len, head_dim) - need to transpose
+                    q = q.transpose(1, 2)
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
+                    need_transpose_back = True
+                else:
+                    # Input is already (batch, seq_len, num_heads, head_dim)
+                    need_transpose_back = False
+            else:
+                need_transpose_back = False
+
+            # Get dimensions
+            batch_size, seq_len, num_heads, head_dim = q.shape
+
+            # Convert to varlen format: flatten batch and sequence dimensions
+            # (batch, seqlen, nheads, headdim) -> (total_tokens, nheads, headdim)
+            q_varlen = q.reshape(-1, num_heads, head_dim)
+            k_varlen = k.reshape(-1, k.shape[2], head_dim)
+            v_varlen = v.reshape(-1, v.shape[2], head_dim)
+
+            # Create cumulative sequence lengths
+            # cu_seqlens: [0, seq_len, 2*seq_len, ..., batch_size*seq_len]
+            cu_seqlens = torch.arange(
+                0, (batch_size + 1) * seq_len, seq_len,
+                dtype=torch.int32, device=q.device
+            )
+
+            # Call Flash Attention varlen (works with both standard flash-attn and vLLM's wrapper)
+            output_varlen = self.flash_attn_varlen_func(
+                q_varlen, k_varlen, v_varlen,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=seq_len,
+                max_seqlen_k=seq_len,
+                softmax_scale=scale,
+                causal=True,
+            )
+
+            # Convert back to batch format
+            # (total_tokens, nheads, headdim) -> (batch, seqlen, nheads, headdim)
+            output = output_varlen.reshape(batch_size, seq_len, num_heads, head_dim)
+
+            # Transpose back if needed
+            if need_transpose_back:
+                output = output.transpose(1, 2)
+
+            return output
+
+        # Default path: Use PyTorch SDPA (same as ScaledDotProductAttentionWrapper)
         with sdpa_kernel(self.sdpa_backends, set_priority=True):
             return F.scaled_dot_product_attention(q, k, v, scale=scale, is_causal=True)
 

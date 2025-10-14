@@ -6,6 +6,7 @@
 #
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -19,12 +20,16 @@ from torchtitan.models.attention import (
     get_causal_mask_mod,
     get_document_mask_mod,
     ScaledDotProductAttentionWrapper,
+    VLLMHybridAttentionWrapper,
 )
 from torchtitan.models.moe import MoE
 from torchtitan.protocols.model import AttentionMasksType
 from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import Qwen3ModelArgs
+
+
+logger = logging.getLogger(__name__)
 
 
 # Adapted from https://github.com/pytorch/torchtune/blob/main/torchtune/models/qwen2/_positional_embeddings.py
@@ -167,8 +172,17 @@ class Attention(nn.Module):
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
 
+        # Choose attention implementation
         if self.use_flex_attn:
             self.inner_attention = FlexAttentionWrapper()
+        elif getattr(model_args, 'use_hybrid_attn', False):
+            # Use hybrid attention for efficient inference with KV caching
+            self.inner_attention = VLLMHybridAttentionWrapper(
+                num_heads=self.n_heads,
+                head_size=self.head_dim,
+                scale=self.scaling,
+                num_kv_heads=self.n_kv_heads,
+            )
         else:
             self.inner_attention = ScaledDotProductAttentionWrapper()
 
@@ -197,7 +211,6 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -229,6 +242,13 @@ class Attention(nn.Module):
         if self.use_flex_attn:
             assert isinstance(attention_masks, BlockMask), attention_masks
             output = self.inner_attention(xq, xk, xv, block_mask=attention_masks)
+        elif isinstance(self.inner_attention, VLLMHybridAttentionWrapper):
+            assert attention_masks is None
+            # Use vLLM path when VLLM_ATTENTION_BACKEND is set to FLASH_ATTN
+            # This allows opt-in to Flash Attention 3 backend matching vLLM
+            import os
+            use_vllm = os.environ.get('VLLM_ATTENTION_BACKEND') == 'FLASH_ATTN'
+            output = self.inner_attention(xq, xk, xv, use_vllm=use_vllm)
         else:
             assert attention_masks is None
             output = self.inner_attention(xq, xk, xv)
